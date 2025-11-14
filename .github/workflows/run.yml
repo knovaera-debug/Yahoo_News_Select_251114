@@ -1,0 +1,59 @@
+name: Auto News Scraper
+
+on:
+  workflow_dispatch:   # 手動実行
+  schedule:
+    # 毎日14:00 JST に実行（UTC 05:00）
+    - cron: "0 5 * * *"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1) ソースコードを取得
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # 2) Python をセットアップ
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    # 3) Chrome と Chromedriver をインストール
+    - name: Install Chrome
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y google-chrome-stable
+
+    - name: Install ChromeDriver
+      uses: nanasess/setup-chromedriver@v2
+      with:
+        chromedriver-version: latest
+
+    - name: Verify Chrome installation
+      run: |
+        google-chrome --version
+        chromedriver --version
+
+    # 4) Python ライブラリをインストール
+    - name: Install Python dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+
+    # 5) 環境変数（Secrets）をセット（ログ上は何もしないステップ）
+    - name: Set environment variables
+      run: echo "Environment set"
+      env:
+        GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+    # 6) main.py を実行
+    - name: Run Python script
+      env:
+        GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      run: |
+        python3 main.py
