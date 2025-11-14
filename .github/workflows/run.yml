@@ -1,56 +1,61 @@
 name: Auto News Scraper
 
 on:
-  workflow_dispatch:   # 手動実行
+  workflow_dispatch:
   schedule:
-    # 毎日14:00 JST に実行（UTC 05:00）
-    - cron: "0 5 * * *"
+    - cron: "0 5 * * *"   # JST 14:00
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
     steps:
-    # 1) ソースコードを取得
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    # 2) Python をセットアップ
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: "3.11"
 
-    # 3) Chrome と Chromedriver をインストール
-    - name: Install Chrome
+    # --- Chrome & Chromedriver (新方式：aptで一括) ---
+    - name: Install Chrome & Chromedriver
       run: |
         sudo apt-get update
-        sudo apt-get install -y google-chrome-stable
+        sudo apt-get install -y wget unzip xvfb
+        wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+        sudo apt install -y ./google-chrome-stable_current_amd64.deb
 
-    - name: Install ChromeDriver
-      uses: nanasess/setup-chromedriver@v2
-      with:
-        chromedriver-version: latest
+        CHROME_VERSION=$(google-chrome --version | sed 's/Google Chrome //')
+        CHROMEDRIVER_VERSION=$(echo $CHROME_VERSION | cut -d '.' -f 1)
 
-    - name: Verify Chrome installation
-      run: |
+        echo "Chrome Version: $CHROME_VERSION"
+        echo "Using Chromedriver Version: $CHROMEDRIVER_VERSION"
+
+        wget -O chromedriver.zip "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chromedriver-linux64.zip" || \
+        wget -O chromedriver.zip "https://storage.googleapis.com/chrome-for-testing-public/${CHROMEDRIVER_VERSION}.0.0/linux64/chromedriver-linux64.zip"
+
+        unzip chromedriver.zip
+        sudo mv chromedriver-linux64/chromedriver /usr/local/bin/
+        sudo chmod +x /usr/local/bin/chromedriver
+
         google-chrome --version
         chromedriver --version
 
-    # 4) Python ライブラリをインストール
+    # --- Python dependencies ---
     - name: Install Python dependencies
       run: |
         pip install --upgrade pip
         pip install -r requirements.txt
 
-    # 5) 環境変数（Secrets）をセット（ログ上は何もしないステップ）
+    # --- Secrets loading ---
     - name: Set environment variables
-      run: echo "Environment set"
+      run: echo "Environment loaded"
       env:
         GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
-    # 6) main.py を実行
+    # --- Run main.py ---
     - name: Run Python script
       env:
         GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
