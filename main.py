@@ -3,7 +3,7 @@
 Yahooニュース統合スクレイパー（国内8社対応版・GitHub Actions用）
  - Yahooシートにニュース一覧＋本文（最大10ページ）を書き込み
  - Commentsシートにコメント（最大10ページ）を書き込み
- - Gemini を使って 10件まとめてバッチ分析し、以下を判定
+ - Gemini を使って 100件まとめてバッチ分析し、以下を判定
     * 主題企業 (P列)
     * カテゴリ (Q列)
     * ポジネガ (R列)
@@ -103,6 +103,9 @@ PROMPT_FILES = [
     "prompt_target_company.txt"
 ]
 
+# Gemini バッチサイズ（100件を1APIで処理）
+GEMINI_MAX_BATCH_SIZE = 100
+
 # ===== Gemini Client 初期化 =====
 try:
     GEMINI_CLIENT = genai.Client()
@@ -196,7 +199,7 @@ def load_keywords(filename: str) -> List[str]:
 def load_gemini_batch_prompt() -> str:
     """
     PROMPT_FILES を読み込み、バッチ分析用のプロンプトテンプレートを作成。
-    10件まとめて JSON 配列で返すように指示する。
+    100件まとめて JSON 配列で返すように指示する。
     """
     global GEMINI_BATCH_PROMPT_BASE
     if GEMINI_BATCH_PROMPT_BASE is not None:
@@ -228,7 +231,7 @@ def load_gemini_batch_prompt() -> str:
         # 追加の明示的な指示（バッチ & 日産抽出）
         extra = """
 追加要件:
-- 与えられる記事本文は最大で10件です。
+- 与えられる記事本文は最大で100件です。
 - それぞれの記事について、以下の情報を判定してください。
   * company_info: 記事の主題企業名。共同開発などがあれば () 内に別企業も書いてください。
   * category: 企業、モデル、技術、社会、投資など、PROMPTで指定のカテゴリ分類に従ってください。
@@ -648,7 +651,7 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
                     all_comments.extend(comments)
                     numbered = []
                     for i, c in enumerate(comments, start=1):
-                        numbered.append(f"[{i}] {c}")
+                        numbered.append(f"[i] {c}")
                     page_strings[page_idx - 1] = "\n\n".join(numbered)
 
             # コメント数更新
@@ -690,7 +693,7 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
 
 def analyze_with_gemini_batch(texts: List[str]) -> List[Dict[str, str]]:
     """
-    最大10件の本文をまとめて Gemini で分析し、JSON配列を返す。
+    最大100件の本文をまとめて Gemini で分析し、JSON配列を返す。
     texts[i] が index=i に対応。
     """
     if not GEMINI_CLIENT:
@@ -699,13 +702,17 @@ def analyze_with_gemini_batch(texts: List[str]) -> List[Dict[str, str]]:
     if not texts:
         return []
 
+    # 念のためバッチサイズを上限に収める
+    if len(texts) > GEMINI_MAX_BATCH_SIZE:
+        texts = texts[:GEMINI_MAX_BATCH_SIZE]
+
     prompt_template = load_gemini_batch_prompt()
     if not prompt_template:
         print("Geminiプロンプトが空のため、バッチ分析をスキップします。")
         return []
 
-    # 長さを制限（1件あたり15,000文字まで）
-    trimmed_texts = [t[:15000] for t in texts]
+    # 長さを制限（1件あたり3000文字まで：100件でも収まるように短めに）
+    trimmed_texts = [t[:3000] for t in texts]
 
     # {TEXT_BATCH} を生成
     blocks = []
@@ -782,7 +789,7 @@ def analyze_and_update_sheet(gc: gspread.Client) -> None:
       - R:ポジネガ
       - S:日産関連文
       - T:日産ネガ文
-    が空のものを対象に、最大10件まとめて Gemini で分析＆更新する。
+    が空のものを対象に、最大100件まとめて Gemini で分析＆更新する。
     """
     if not GEMINI_CLIENT:
         print("Geminiクライアントが初期化されていないため、分析をスキップします。")
@@ -796,7 +803,7 @@ def analyze_and_update_sheet(gc: gspread.Client) -> None:
 
     data_rows = values[1:]
 
-    print("\n===== 🧠 ステップ3: Geminiバッチ分析 (10件/1API) =====")
+    print("\n===== 🧠 ステップ3: Geminiバッチ分析 (100件/1API) =====")
 
     # 分析対象行を収集
     targets: List[Dict[str, Any]] = []
@@ -842,9 +849,9 @@ def analyze_and_update_sheet(gc: gspread.Client) -> None:
     print(f"  Gemini分析対象: {len(targets)} 行")
 
     updated_count = 0
-    # 10件ずつバッチ処理
-    for i in range(0, len(targets), 10):
-        batch = targets[i : i + 10]
+    # 100件ずつバッチ処理
+    for i in range(0, len(targets), GEMINI_MAX_BATCH_SIZE):
+        batch = targets[i : i + GEMINI_MAX_BATCH_SIZE]
         texts = [t["body"] for t in batch]
         print(f"  - {i+1}〜{i+len(batch)}件目をバッチ分析中...")
 
@@ -914,7 +921,7 @@ def main():
     # ステップ2: 本文＆コメント取得 + Commentsシート更新
     fetch_details_and_update(gc)
 
-    # ステップ3: Geminiバッチ分析
+    # ステップ3: Geminiバッチ分析 (100件/1API)
     analyze_and_update_sheet(gc)
 
     print("\n--- Yahooニュース統合スクレイパー完了 ---")
