@@ -45,7 +45,7 @@ from google.api_core.exceptions import ResourceExhausted
 # ------------------------------------
 
 # ====== 設定 ======
-SHARED_SPREADSHEET_ID = "1Ru2DT_zzKjTJptchWJitCb67VoffImGhgeOVjwlKukc"
+SHARED_SPREADSHEET_ID = "1WUnLv7TIxY1-PPyLAmks2CEfAcfse51He32l79eUf7E"
 KEYWORD_FILE = "keywords.txt"
 SOURCE_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 SOURCE_SHEET_NAME = "Yahoo"
