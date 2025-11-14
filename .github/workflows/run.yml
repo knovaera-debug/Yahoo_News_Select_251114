@@ -18,28 +18,46 @@ jobs:
       with:
         python-version: "3.11"
 
-    # --- Chrome & Chromedriver (新方式：aptで一括) ---
-    - name: Install Chrome & Chromedriver
+    # --- Install Chrome ---
+    - name: Install Chrome
       run: |
         sudo apt-get update
-        sudo apt-get install -y wget unzip xvfb
+        sudo apt-get install -y wget jq unzip
         wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
         sudo apt install -y ./google-chrome-stable_current_amd64.deb
+        google-chrome --version
 
-        CHROME_VERSION=$(google-chrome --version | sed 's/Google Chrome //')
-        CHROMEDRIVER_VERSION=$(echo $CHROME_VERSION | cut -d '.' -f 1)
+    # --- Install Chromedriver via Google API ---
+    - name: Install Chromedriver
+      run: |
+        CHROME_VERSION=$(google-chrome --version | awk '{print $3}')
+        MAJOR_VERSION=$(echo $CHROME_VERSION | cut -d. -f1)
 
         echo "Chrome Version: $CHROME_VERSION"
-        echo "Using Chromedriver Version: $CHROMEDRIVER_VERSION"
+        echo "Major Version : $MAJOR_VERSION"
 
-        wget -O chromedriver.zip "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chromedriver-linux64.zip" || \
-        wget -O chromedriver.zip "https://storage.googleapis.com/chrome-for-testing-public/${CHROMEDRIVER_VERSION}.0.0/linux64/chromedriver-linux64.zip"
+        # Google official versions list
+        wget -q https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json
 
+        # 最新の同メジャーバージョンのChromeDriverを取得
+        DRIVER_VERSION=$(jq -r ".versions[] | select(.version | startswith(\"$MAJOR_VERSION.\")) | .version" \
+          known-good-versions-with-downloads.json | sort -V | tail -n 1)
+
+        echo "Matched Chromedriver Version: $DRIVER_VERSION"
+
+        # ダウンロードURL取得
+        DL_URL=$(jq -r ".versions[] | select(.version==\"$DRIVER_VERSION\") \
+          | .downloads.chromedriver[] \
+          | select(.platform==\"linux64\") \
+          | .url" known-good-versions-with-downloads.json)
+
+        echo "Driver URL: $DL_URL"
+
+        wget -O chromedriver.zip "$DL_URL"
         unzip chromedriver.zip
         sudo mv chromedriver-linux64/chromedriver /usr/local/bin/
         sudo chmod +x /usr/local/bin/chromedriver
 
-        google-chrome --version
         chromedriver --version
 
     # --- Python dependencies ---
@@ -48,14 +66,14 @@ jobs:
         pip install --upgrade pip
         pip install -r requirements.txt
 
-    # --- Secrets loading ---
+    # --- Secrets ---
     - name: Set environment variables
       run: echo "Environment loaded"
       env:
         GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
-    # --- Run main.py ---
+    # --- Run Script ---
     - name: Run Python script
       env:
         GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
