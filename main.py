@@ -54,7 +54,7 @@ DEST_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 MAX_SHEET_ROWS_FOR_REPLACE = 10000
 MAX_PAGES = 10 # 記事本文取得の最大巡回ページ数 (※ロジック改修により現在は1ページのみ取得)
 
-YAHOO_SHEET_HEADERS = ["URL", "タイトル", "投稿日時", "ソース", "本文1", "本文2", "本文3", "本文4", "本文5", "本文6", "本文7", "本文8", "本文9", "本文10", "コメント数", "対象企業", "カテゴリ分類", "ポジネガ分類"]
+YAHOO_SHEET_HEADERS = ["URL", "タイトル", "投稿日時", "ソース", "本文1", "本文2", "本文3", "本文4", "本文5", "本文6", "本文7", "本文8", "本文9", "本文10", "コメント数", "対象企業", "カテゴリ分類", "ポジネガ分類", "日産関連文章", "日産ネガ文章"]
 REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
 TZ_JST = timezone(timedelta(hours=9))
 
@@ -224,6 +224,46 @@ def request_with_retry(url: str, max_retries: int = 3) -> Optional[requests.Resp
     return None
 
 # ====== Gemini 分析関数 (変更なし) ======
+def extract_nissan_sentences(full_text: str) -> str:
+    """本文から日産関連の文章を抽出して返す"""
+    if not full_text.strip():
+        return ""
+    nissan_keywords = [
+        "日産", "ニッサン", "NISSAN", "nissan",
+        "e-POWER", "e-power", "ePower",
+        "エクストレイル", "セレナ", "エルグランド", "アリア",
+        "キックス", "サクラ", "スカイライン", "フェアレディZ",
+        "リーフ", "ノート"
+    ]
+    sentences = re.split(r"[。．!?！？]", full_text)
+    hits = []
+    for s in sentences:
+        if any(k in s for k in nissan_keywords):
+            t = s.strip()
+            if t:
+                hits.append(t)
+    return "\n".join(hits)
+
+
+def extract_nissan_negative_sentences(nissan_text: str) -> str:
+    """日産関連の文章の中からネガティブな文のみ抽出"""
+    if not nissan_text.strip():
+        return ""
+    negative_keywords = [
+        "不具合", "故障", "リコール", "批判", "問題", "炎上",
+        "不安", "欠陥", "失敗", "悪い", "低評価", "トラブル",
+        "しない", "不足", "できない", "遅れ", "改善されていない"
+    ]
+    sentences = re.split(r"[。．!?！？]", nissan_text)
+    hits = []
+    for s in sentences:
+        if any(k in s for k in negative_keywords):
+            t = s.strip()
+            if t:
+                hits.append(t)
+    return "\n".join(hits)
+
+
 def analyze_with_gemini(text_to_analyze: str) -> Tuple[str, str, str, bool]:
     if not GEMINI_CLIENT:
         return "N/A", "N/A", "N/A", False
@@ -400,96 +440,78 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     return articles_data
 
 # ====== 詳細取得関数 (複数ページ取得ロジックを削除し、1ページ目のみ取得に修正) ======
-def fetch_article_body_and_comments(base_url: str) -> Tuple[List[str], int, Optional[str]]:
+def fetch_article_body_and_comments(base_url: str) -> Tuple[str, int, Optional[str]]:
     """
-    Yahoo!ニュース記事の本文とコメント数を取得する。
-    - 本文は最大 MAX_PAGES ページまで巡回し、ページごとに1要素としたリストで返す。
-    - 1ページ目が取得できない場合は本文取得不可とみなす。
-    - コメント数と、C列補完用の日時文字列（「10/20 15:30」形式）も返す。
+    記事IDベースの '?page=N' パラメータを使用した複数ページ巡回ロジックを削除し、
+    1ページ目のみの取得に修正。
     """
-    comment_count: int = -1  # コメント数が取得できない場合は -1 (未取得)としてマーク
-    extracted_date_str: Optional[str] = None
-
+    comment_count = -1 # 💡 改修点①: コメント数が取得できない場合は -1 (未取得)としてマーク
+    extracted_date_str = None
+    
     # URLから記事IDを取得 (例: aaa7c40ed1706ff109ad5e48ccebbfe598805ffd)
     article_id_match = re.search(r'/articles/([a-f0-9]+)', base_url)
     if not article_id_match:
         print(f"  ❌ URLから記事IDが抽出できませんでした: {base_url}")
-        return [], -1, None
+        return "本文取得不可", -1, None
+        
+    # 常に1ページ目（ベースURL）のみを取得
+    current_url = base_url.split('?')[0] # パラメータを削除してベースURLを確保
+    
+    # 2. HTML取得とBeautifulSoupの初期化
+    response = request_with_retry(current_url)
+    
+    if not response:
+        # 💡 改修点②: request_with_retryでリトライ後も取得できなかった場合（404を含む）、スキップ
+        print(f"  ❌ 記事本文の取得に失敗したため、本文取得不可を返します。: {current_url}")
+        return "本文取得不可", -1, None
+        
+    print(f"  - 記事本文 ページ 1 を取得しました。")
+    soup = BeautifulSoup(response.text, 'html.parser')
 
-    base_article_url = base_url.split('?')[0]  # パラメータを削除してベースURLを確保
+    # 3. 記事本文の抽出 (ページ1のみ)
+    article_content = soup.find('article') or soup.find('div', class_='article_body') or soup.find('div', class_=re.compile(r'article_detail|article_body'))
 
-    all_pages_body: List[str] = []
+    current_body = []
+    if article_content:
+        # 最新のHTML構造に対応したセレクタ
+        paragraphs = article_content.find_all('p', class_=re.compile(r'sc-\w+-0\s+\w+.*highLightSearchTarget'))
+        if not paragraphs: # 上記セレクタで取得できなければ汎用<p>を試す
+            paragraphs = article_content.find_all('p')
+            
+        for p in paragraphs:
+            text = p.get_text(strip=True)
+            if text:
+                current_body.append(text)
+    
+    # 4. 本文を結合
+    body_text = "\n".join(current_body)
+    
+    # --- コメント数と日時 ---
+    
+    # コメント数を表すボタンまたはリンクを探す
+    comment_button = soup.find("button", attrs={"data-cl-params": re.compile(r"cmtmod")}) or \
+                         soup.find("a", attrs={"data-cl-params": re.compile(r"cmtmod")})
+    if comment_button:
+        # コメント数を含む要素から数字を抽出
+        text = comment_button.get_text(strip=True).replace(",", "")
+        match = re.search(r'(\d+)', text)
+        if match:
+            comment_count = int(match.group(1)) # 0以上の値
 
-    for page in range(1, MAX_PAGES + 1):
-        # 1ページ目はそのまま、2ページ目以降は ?page=N を付与
-        if page == 1:
-            current_url = base_article_url
-        else:
-            current_url = f"{base_article_url}?page={page}"
+    # C列補完用の日時を本文の冒頭から抽出（「10/20(月) 15:30配信」形式）
+    if body_text:
+        body_text_partial = "\n".join(body_text.split('\n')[:3])
+        match = re.search(r'(\d{1,2}/\d{1,2})\([月火水木金土日]\)(\s*)(\d{1,2}:\d{2})配信', body_text_partial)
+        if match:
+            month_day = match.group(1)
+            time_str = match.group(3)
+            # 曜日・配信を削除した形式 (例: 10/20 15:30)
+            extracted_date_str = f"{month_day} {time_str}"
+            
+    return body_text if body_text else "本文取得不可", comment_count, extracted_date_str
 
-        response = request_with_retry(current_url)
 
-        if not response:
-            # 1ページ目が取得できない場合は、本文取得不可として終了
-            if page == 1:
-                print(f"  ❌ 記事本文(1ページ目)の取得に失敗したため、本文取得不可を返します。: {current_url}")
-                return [], -1, None
-            else:
-                # 2ページ目以降で取得できない場合は、そこから先は存在しないとみなして打ち切り
-                print(f"  🔚 ページ {page} の取得に失敗したため、これ以降のページ取得を打ち切ります。")
-                break
-
-        print(f"  - 記事本文 ページ {page} を取得しました。")
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        # 記事本文の抽出
-        article_content = (
-            soup.find("article")
-            or soup.find("div", class_="article_body")
-            or soup.find("div", class_=re.compile(r"article_detail|article_body"))
-        )
-
-        current_body_lines: List[str] = []
-        if article_content:
-            # 最新のHTML構造に対応したセレクタ
-            paragraphs = article_content.find_all("p", class_=re.compile(r"sc-\w+-0\s+\w+.*highLightSearchTarget"))
-            if not paragraphs:  # 上記セレクタで取得できなければ汎用<p>を試す
-                paragraphs = article_content.find_all("p")
-
-            for p in paragraphs:
-                text = p.get_text(strip=True)
-                if text:
-                    current_body_lines.append(text)
-
-        page_text = "\n".join(current_body_lines).strip()
-
-        # 本文テキストが空の場合は、それ以降のページもないとみなして打ち切り
-        if not page_text:
-            print(f"  🔚 ページ {page} には本文が見つからなかったため、これ以降のページ取得を打ち切ります。")
-            break
-
-        all_pages_body.append(page_text)
-
-        # コメント数と日時抽出は 1ページ目のみを対象とする
-        if page == 1:
-            comment_button = soup.find("button", attrs={"data-cl-params": re.compile(r"cmtmod")}) or soup.find(
-                "a", attrs={"data-cl-params": re.compile(r"cmtmod")}
-            )
-            if comment_button:
-                text = comment_button.get_text(strip=True).replace(",", "")
-                match = re.search(r"(\d+)", text)
-                if match:
-                    comment_count = int(match.group(1))
-
-            # C列補完用の日時を本文の冒頭から抽出（「10/20(月) 15:30配信」形式）
-            body_text_partial = "\n".join(page_text.split("\n")[:3])
-            match_date = re.search(r"(\d{1,2}/\d{1,2})\([月火水木金土日]\)(\s*)(\d{1,2}:\d{2})配信", body_text_partial)
-            if match_date:
-                month_day = match_date.group(1)
-                time_str = match_date.group(3)
-                extracted_date_str = f"{month_day} {time_str}"  # 例: 10/20 15:30
-
-    return all_pages_body, comment_count, extracted_date_str
+# ====== スプレッドシート操作関数 (ソート/置換ロジックを修正) ======
 
 def set_row_height(ws: gspread.Worksheet, row_height_pixels: int):
     try:
@@ -693,121 +715,116 @@ def sort_yahoo_sheet(gc: gspread.Client):
 
 def fetch_details_and_update_sheet(gc: gspread.Client):
     """ 
-    本文（最大10ページ）とコメント数の取得、およびC列の日付補完を行い、行ごとに即時更新する。
+    E列, F列が未入力の行に対し、詳細取得とC列の日付補完を行い、行ごとに即時更新する。
     💡 改修点: 
-        1. 本文はページごとに E〜N 列（本文1〜本文10）へ格納。
-        2. 本文取得済 かつ 3日以内の記事は、コメント数のみ更新（本文は更新しない）。
+        1. 本文取得は初回のみ。
+        2. 本文取得済 かつ 3日以内の記事は、コメント数のみ更新。
         3. 本文取得済 かつ 3日より古い記事は、完全にスキップ。
     """
+    
     sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
     try:
         ws = sh.worksheet(SOURCE_SHEET_NAME)
     except gspread.exceptions.WorksheetNotFound:
         print("詳細取得スキップ: Yahooシートが見つかりません。")
         return
-
-    all_values = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
+        
+    all_values = ws.get_all_values(value_render_option='UNFORMATTED_VALUE')
     if len(all_values) <= 1:
         print(" Yahooシートにデータがないため、詳細取得をスキップします。")
         return
-
+        
     data_rows = all_values[1:]
     update_count = 0
-
-    print("\n===== 📄 ステップ② 記事本文(複数ページ)とコメント数の取得・即時反映 (E〜N列, O列) =====")
+    
+    print("\n===== 📄 ステップ② 記事本文とコメント数の取得・即時反映 (E, F列) =====")
 
     now_jst = jst_now()
+    # 境界線の設定: プログラム実行日から3日前の00:00:00を計算
     three_days_ago = (now_jst - timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
 
     for idx, data_row in enumerate(data_rows):
         # 行の長さを確認し、YAHOO_SHEET_HEADERS の数に合わせて埋める
         if len(data_row) < len(YAHOO_SHEET_HEADERS):
-            data_row.extend([""] * (len(YAHOO_SHEET_HEADERS) - len(data_row)))
-
+            data_row.extend([''] * (len(YAHOO_SHEET_HEADERS) - len(data_row)))
+            
         row_num = idx + 2
-
+        
         url = str(data_row[0])
         title = str(data_row[1])
-        post_date_raw = str(data_row[2])  # C列
-        source = str(data_row[3])         # D列
-
-        # 本文1〜本文10 (E〜N列)
-        page_bodies = [str(col) for col in data_row[4:14]]  # 10列分
-        # コメント数 (O列)
-        comment_count_str = str(data_row[14]) if len(data_row) > 14 else ""
-
-        if not url.strip() or not url.startswith("http"):
+        post_date_raw = str(data_row[2]) # C列
+        source = str(data_row[3])        # D列
+        body = str(data_row[4])          # E列
+        comment_count_str = str(data_row[5]) # F列
+        
+        if not url.strip() or not url.startswith('http'):
             print(f"  - 行 {row_num}: URLが無効なためスキップ。")
             continue
 
-        # 本文がすでに取得済みかどうか（いずれかのページに有効な本文があれば取得済みとみなす）
-        is_content_fetched = any(b.strip() and b != "本文取得不可" for b in page_bodies)
-        needs_body_fetch = not is_content_fetched
+        is_content_fetched = (body.strip() and body != "本文取得不可") # 本文が取得済みかどうか
+        needs_body_fetch = not is_content_fetched # 本文取得が初回必要かどうか
+        
+        post_date_dt = parse_post_date(post_date_raw, now_jst)
 
-        post_date_dt = parse_post_date(post_date_raw, jst_now())
-        is_within_three_days = bool(post_date_dt and post_date_dt >= three_days_ago)
-
+        # 投稿日時が3日以内であるか
+        is_within_three_days = (post_date_dt and post_date_dt >= three_days_ago)
+        
+        
+        # --- 判定ロジック ---
+        
         # 1. 【完全スキップ】 本文取得済み かつ 3日より古い記事
         if is_content_fetched and not is_within_three_days:
             print(f"  - 行 {row_num} (記事: {title[:20]}...): 本文取得済みかつ3日より古い記事のため、**完全スキップ**。")
             continue
-
+            
         # 2. 【コメントのみ更新】 本文取得済み かつ 3日以内 の記事
         is_comment_only_update = is_content_fetched and is_within_three_days
-
+        
         # 3. 【完全更新】 本文未取得の記事 (3日以内/外に関わらず本文取得を試みる)
         needs_full_fetch = needs_body_fetch
-
+        
         # 4. 詳細取得の実行が必要な場合: 2 または 3 のいずれか
         needs_detail_fetch = is_comment_only_update or needs_full_fetch
+
         if not needs_detail_fetch:
             print(f"  - 行 {row_num} (記事: {title[:20]}...): 詳細更新の必要がないためスキップ。")
             continue
 
+
+        # --- 詳細取得を実行 ---
         if needs_full_fetch:
-            print(f"  - 行 {row_num} (記事: {title[:20]}...): **本文(最大10ページ)/コメント数/日時補完を取得中... (完全取得)**")
+            print(f"  - 行 {row_num} (記事: {title[:20]}...): **本文/コメント数/日時補完を取得中... (完全取得)**")
         elif is_comment_only_update:
             print(f"  - 行 {row_num} (記事: {title[:20]}...): **コメント数を更新中... (軽量更新)**")
+            
+        fetched_body, fetched_comment_count, extracted_date = fetch_article_body_and_comments(url)
 
-        fetched_pages, fetched_comment_count, extracted_date = fetch_article_body_and_comments(url)
-
-        new_post_date = post_date_raw
+        new_body = body
         new_comment_count = comment_count_str
-        new_page_bodies = page_bodies[:]
+        new_post_date = post_date_raw
+        
         needs_update_to_sheet = False
 
-        # 1. 本文(E〜N列)の更新
+        # 1. E列(本文)の更新 (本文未取得の場合のみ)
         if needs_full_fetch:
-            if fetched_pages:
-                # ページごとに本文を詰める（最大10ページ）
-                for i in range(10):
-                    new_val = fetched_pages[i] if i < len(fetched_pages) else ""
-                    if new_page_bodies[i] != new_val:
-                        new_page_bodies[i] = new_val
-                        needs_update_to_sheet = True
-            else:
-                # 全ページ取得失敗時は、本文1のみ「本文取得不可」、それ以外は空にする
-                if new_page_bodies[0] != "本文取得不可":
-                    new_page_bodies[0] = "本文取得不可"
+            if fetched_body != "本文取得不可":
+                if new_body != fetched_body:
+                    new_body = fetched_body
                     needs_update_to_sheet = True
-                for i in range(1, 10):
-                    if new_page_bodies[i] != "":
-                        new_page_bodies[i] = ""
-                        needs_update_to_sheet = True
-        elif is_comment_only_update and not fetched_pages:
-            # コメント更新目的でアクセスしたが記事が削除されていた場合など
-            if new_page_bodies[0] != "本文取得不可":
-                new_page_bodies[0] = "本文取得不可"
-                needs_update_to_sheet = True
-            for i in range(1, 10):
-                if new_page_bodies[i] != "":
-                    new_page_bodies[i] = ""
-                    needs_update_to_sheet = True
-
+            elif body != "本文取得不可": # 以前成功した本文が上書きされないように、本文取得不可になった場合のみ更新
+                 new_body = "本文取得不可"
+                 needs_update_to_sheet = True
+        elif is_comment_only_update and fetched_body == "本文取得不可":
+            # コメント更新目的でAPIを叩いたが、記事が404などで消えていた場合、E列を更新
+             if body != "本文取得不可":
+                 new_body = "本文取得不可"
+                 needs_update_to_sheet = True
+            
         # 2. C列(日時)の更新 (本文未取得の場合、または日付が空の場合のみ)
         if needs_full_fetch and ("取得不可" in post_date_raw or not post_date_raw.strip()) and extracted_date:
-            dt_obj = parse_post_date(extracted_date, jst_now())
+            dt_obj = parse_post_date(extracted_date, now_jst)
             if dt_obj:
+                # format_datetimeで yyyy/mm/dd hh:mm:ss 形式に変換
                 formatted_dt = format_datetime(dt_obj)
                 if formatted_dt != post_date_raw:
                     new_post_date = formatted_dt
@@ -817,32 +834,38 @@ def fetch_details_and_update_sheet(gc: gspread.Client):
                 if raw_date != post_date_raw:
                     new_post_date = raw_date
                     needs_update_to_sheet = True
-
-        # 3. O列(コメント数)の更新
+            
+        # 3. F列(コメント数)の更新
         if fetched_comment_count != -1:
+            # needs_full_fetch=True (初回取得) または is_comment_only_update=True (3日以内かつ本文取得済) の場合
             if needs_full_fetch or is_comment_only_update:
                 if str(fetched_comment_count) != comment_count_str:
                     new_comment_count = str(fetched_comment_count)
                     needs_update_to_sheet = True
         else:
-            if needs_detail_fetch:
+            if needs_detail_fetch: # 取得を試みた場合のみログ出力
                 print(f"    - ⚠️ コメント数の取得に失敗しました。既存の値 ({comment_count_str}) を維持します。")
 
+
         if needs_update_to_sheet:
-            # C〜O列を即時更新
+            # C, D, E, F列を即時更新 (D列はソース。本文取得では更新されないが、更新範囲に含める)
+            # C: new_post_date, D: source (変更なし), E: new_body, F: new_comment_count
             ws.update(
-                range_name=f"C{row_num}:O{row_num}",
-                values=[[new_post_date, source] + new_page_bodies + [new_comment_count]],
-                value_input_option="USER_ENTERED",
+                range_name=f'C{row_num}:F{row_num}',
+                values=[[new_post_date, source, new_body, new_comment_count]],
+                value_input_option='USER_ENTERED'
             )
             update_count += 1
             time.sleep(1 + random.random() * 0.5)
 
-    print(f" ✅ 本文(最大10ページ)/コメント数取得と日時補完を {update_count} 行について実行し、即時反映しました。")
+    print(f" ✅ 本文/コメント数取得と日時補完を {update_count} 行について実行し、即時反映しました。")
+
+
+# ====== Gemini分析の実行と強制中断 (G, H, I列) (変更なし) ======
 
 def analyze_with_gemini_and_update_sheet(gc: gspread.Client):
     """ 
-    P列, Q列, R列が未入力の行に対し、Gemini分析を行い、分析結果を即時更新する。
+    P〜T列が未入力の行に対し、Gemini分析と日産関連抽出を行い、分析結果を即時更新する。
     本文は E〜N 列（本文1〜本文10）を結合して 1 本のテキストとして解析に使用する。
     """
     sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
@@ -860,7 +883,7 @@ def analyze_with_gemini_and_update_sheet(gc: gspread.Client):
     data_rows = all_values[1:]
     update_count = 0
 
-    print("\n===== 🧠 ステップ④ Gemini分析の実行・即時反映 (P, Q, R列) =====")
+    print("\n===== 🧠 ステップ④ Gemini分析 + 日産抽出の実行・即時反映 (P〜T列) =====")
 
     for idx, data_row in enumerate(data_rows):
         if len(data_row) < len(YAHOO_SHEET_HEADERS):
@@ -872,12 +895,21 @@ def analyze_with_gemini_and_update_sheet(gc: gspread.Client):
         title = str(data_row[1])
         # 本文1〜本文10 (E〜N列)
         page_bodies = [str(col) for col in data_row[4:14]]
-        # 対象企業(P), カテゴリ(Q), ポジネガ(R)
+        # 対象企業(P), カテゴリ(Q), ポジネガ(R), 日産関連(S), 日産ネガ(T)
         company_info = str(data_row[15]) if len(data_row) > 15 else ""
         category = str(data_row[16]) if len(data_row) > 16 else ""
         sentiment = str(data_row[17]) if len(data_row) > 17 else ""
+        nissan_related_existing = str(data_row[18]) if len(data_row) > 18 else ""
+        nissan_negative_existing = str(data_row[19]) if len(data_row) > 19 else ""
 
-        needs_analysis = not company_info.strip() or not category.strip() or not sentiment.strip()
+        # どれか1つでも空なら再分析対象とする（既存行の埋め直しもカバー）
+        needs_analysis = (
+            not company_info.strip()
+            or not category.strip()
+            or not sentiment.strip()
+            or not nissan_related_existing.strip()
+            or not nissan_negative_existing.strip()
+        )
         if not needs_analysis:
             continue
 
@@ -889,8 +921,8 @@ def analyze_with_gemini_and_update_sheet(gc: gspread.Client):
         if not full_body.strip():
             print(f"  - 行 {row_num}: 本文がないため分析をスキップし、N/Aを設定。")
             ws.update(
-                range_name=f"P{row_num}:R{row_num}",
-                values=[["N/A(No Body)", "N/A", "N/A"]],
+                range_name=f"P{row_num}:T{row_num}",
+                values=[["N/A(No Body)", "N/A", "N/A", "", ""]],
                 value_input_option="USER_ENTERED",
             )
             update_count += 1
@@ -901,19 +933,25 @@ def analyze_with_gemini_and_update_sheet(gc: gspread.Client):
             print(f"  - 行 {row_num}: URLがないためスキップ。")
             continue
 
-        print(f"  - 行 {row_num} (記事: {title[:20]}...): Gemini分析を実行中...")
+        print(f"  - 行 {row_num} (記事: {title[:20]}...): Gemini分析 + 日産抽出を実行中...")
 
+        # Geminiで企業・カテゴリ・ポジネガを判定
         final_company_info, final_category, final_sentiment, _ = analyze_with_gemini(full_body)
 
+        # 日産関連抽出
+        nissan_related = extract_nissan_sentences(full_body)
+        nissan_negative = extract_nissan_negative_sentences(nissan_related)
+
         ws.update(
-            range_name=f"P{row_num}:R{row_num}",
-            values=[[final_company_info, final_category, final_sentiment]],
+            range_name=f"P{row_num}:T{row_num}",
+            values=[[final_company_info, final_category, final_sentiment, nissan_related, nissan_negative]],
             value_input_option="USER_ENTERED",
         )
         update_count += 1
         time.sleep(1 + random.random() * 0.5)
 
-    print(f" ✅ Gemini分析を {update_count} 行について実行し、即時反映しました。")
+    print(f" ✅ Gemini分析 + 日産抽出を {update_count} 行について実行し、即時反映しました。")
+
 
 def main():
     print("--- 統合スクリプト開始 ---")
