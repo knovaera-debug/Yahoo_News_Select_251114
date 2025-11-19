@@ -16,9 +16,8 @@ import time
 import re
 import random
 from datetime import datetime, timedelta, timezone
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Optional, Dict, Any
 import sys
-from urllib.parse import urlparse, parse_qs, urlunparse, urlencode
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from bs4 import BeautifulSoup
@@ -66,11 +65,11 @@ YAHOO_SHEET_HEADERS = [
     "本文_P7",  # K
     "本文_P8",  # L
     "本文_P9",  # M
-    "本文_P10",  # N
+    "本文_P10", # N
     "コメント数",  # O
-    "主題企業",  # P
-    "カテゴリ",  # Q
-    "ポジネガ",  # R
+    "主題企業",    # P
+    "カテゴリ",    # Q
+    "ポジネガ",    # R
     "日産関連文",  # S
     "日産ネガ文"   # T
 ]
@@ -83,7 +82,7 @@ COMMENTS_SHEET_HEADERS = [
     "投稿日時",  # C
     "ソース",   # D
     "コメント数" # E
-    # F〜: コメントページ1〜10
+    # F〜: コメント_P1〜P10 を追加
 ]
 
 REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -108,7 +107,6 @@ except Exception as e:
 GEMINI_BATCH_PROMPT_BASE = None  # バッチ用プロンプトテンプレート
 
 # ================== ヘルパー関数 ==================
-
 def to_str_safe(x) -> str:
     """None/数値/文字列を安全に文字列へ。前後空白は除去。"""
     if x is None:
@@ -130,21 +128,21 @@ def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
     if raw is None:
         return None
     if isinstance(raw, (int, float)):
-        # gspreadは数値をそのまま返す可能性あり。ここでは未対応→Noneを返却。
+        # gspreadは数値で返す可能性があるが、本関数では未対応→None
         return None
     if isinstance(raw, str):
         s = raw.strip()
         # （月）などの曜日を削除
-        s = re.sub(r"\([\u6708\u706b\u6c34\u6728\u91d1\u571f\u65e5]\)", "", s).strip()
+        s = re.sub(r"\([\u6708\u706b\u6c水\u6728\u91d1\u571f\u65e5]\)", "", s).strip()
         # 「配信」を削除
         s = s.replace("配信", "").strip()
-        # よくあるパターンを順に試す
+        # よくあるフォーマットを順に試す
         for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%y/%m/%d %H:%M", "%m/%d %H:%M"):
             try:
                 dt = datetime.strptime(s, fmt)
                 if fmt == "%m/%d %H:%M":
                     dt = dt.replace(year=today_jst.year)
-                # 未来すぎる場合は前年に補正
+                # 未来すぎる場合は前年補正
                 if dt.replace(tzinfo=TZ_JST) > today_jst + timedelta(days=31):
                     dt = dt.replace(year=dt.year - 1)
                 return dt.replace(tzinfo=TZ_JST)
@@ -224,7 +222,7 @@ def load_gemini_batch_prompt() -> str:
 - 与えられる記事本文は最大で100件です。
 - それぞれの記事について、以下の情報を判定してください。
  * company_info: 記事の主題企業名。共同開発などがあれば () 内に別企業も書いてください。
- * category: 企業、モデル、技術、社会、投資など、PROMPTで指定のカテゴリ分類に従ってください。
+ * category: PROMPTで指定のカテゴリ分類に従ってください。
  * sentiment: 記事全体のトーンを「ポジティブ」「ネガティブ」「ニュートラル」のいずれかで判定してください。
  * nissan_related: 記事本文中で「日産」や「NISSAN」「ニッサン」など、日産自動車やその商品・サービスに言及している文を、日本語の文章として可能な限り抽出してまとめてください。なければ "N/A" としてください。
  * nissan_negative: 上記 nissan_related の文のうち、日産や日産の商品・サービスに対してネガティブな印象を与える内容（批判・不満・懸念など）だけを抽出してまとめてください。なければ "N/A" としてください。
@@ -279,7 +277,6 @@ def request_with_retry(url: str, max_retries: int = 3) -> Optional[requests.Resp
     return None
 
 # ================== Yahooニュース検索 (Selenium) ==================
-
 def get_yahoo_news_with_selenium(keyword: str) -> List[Dict[str, str]]:
     print(f" Yahoo!ニュース検索開始 (キーワード: {keyword})...")
     options = Options()
@@ -333,7 +330,7 @@ def get_yahoo_news_with_selenium(keyword: str) -> List[Dict[str, str]]:
             )
             time_tag = article.find("time")
             date_str = time_tag.text.strip() if time_tag else ""
-            # ソース抽出（構造は頻繁に変わるため、長めテキストを採用）
+            # ソース抽出（構造は変わりやすいので長めテキストを採用）
             source_text = ""
             source_container = article.find("div", class_=re.compile("sc-n3vj8g-0"))
             if source_container:
@@ -344,7 +341,7 @@ def get_yahoo_news_with_selenium(keyword: str) -> List[Dict[str, str]]:
                         for s in time_and_comments.find_all("span")
                         if not s.find("svg")
                     ]
-                    # 日付らしきものは除去
+                    # 日付っぽいものは除外
                     spans = [
                         s for s in spans
                         if not re.match(r"\d{1,2}/\d{1,2}.*\d{1,2}:\d{2}", s)
@@ -358,7 +355,7 @@ def get_yahoo_news_with_selenium(keyword: str) -> List[Dict[str, str]]:
                 if dt_obj:
                     formatted_date = format_datetime(dt_obj)
                 else:
-                    formatted_date = re.sub(r"\([\u6708\u706b\u6c34\u6728\u91d1\u571f\u65e5]\)", "", date_str).strip()
+                    formatted_date = re.sub(r"\([\u670月火水木金土日]\)", "", date_str).strip()
 
             if title and url:
                 articles_data.append(
@@ -376,7 +373,6 @@ def get_yahoo_news_with_selenium(keyword: str) -> List[Dict[str, str]]:
     return articles_data
 
 # ================== シート操作ヘルパー ==================
-
 def ensure_yahoo_sheet(gc: gspread.Client) -> gspread.Worksheet:
     sh = gc.open_by_key(SOURCE_SPREADSHEET_ID)
     try:
@@ -441,7 +437,6 @@ def write_news_list_to_source(gc: gspread.Client, articles: List[Dict[str, str]]
         print(" 追記すべき新規記事はありません。")
 
 # ================== 本文・コメント取得 ==================
-
 def fetch_article_body_page(url: str) -> str:
     """
     記事の単一ページから本文テキストを抽出
@@ -459,9 +454,7 @@ def fetch_article_body_page(url: str) -> str:
     texts: List[str] = []
     if article_content:
         # ハイライト対象の p から優先的に取得
-        paragraphs = article_content.find_all(
-            "p", class_=re.compile(r"highLightSearchTarget")
-        )
+        paragraphs = article_content.find_all("p", class_=re.compile(r"highLightSearchTarget"))
         if not paragraphs:
             paragraphs = article_content.find_all("p")
         for p in paragraphs:
@@ -473,27 +466,90 @@ def fetch_article_body_page(url: str) -> str:
 def fetch_comments_page(url: str) -> List[str]:
     """
     コメントページ1枚分からコメント本文をリストで返す。
-    （YahooのHTML構造は頻繁に変わるため、汎用的なセレクタで取得）
+    YahooのHTML構造変化に強めの“範囲指定＋限定セレクタ”＋“ノイズ除去”で抽出する。
     """
     res = request_with_retry(url)
     if not res:
         return []
+
     soup = BeautifulSoup(res.text, "html.parser")
-    comments: List[str] = []
-    # 代表的なクラス名をいくつか試しながらコメント本文っぽい要素を拾う
-    candidate_selectors = [
-        "div[class*='CommentItem__body']",
-        "p[class*='CommentItem__body']",
-        "span[class*='CommentItem__body']",
-        "p[class*='sc-']",
+
+    # --- コメント領域の起点候補（ページ構造の揺れ対策で複数試す） ---
+    container_candidates = [
+        {"name": "section", "attrs": {"id": re.compile(r"^comments?$", re.I)}},
+        {"name": "section", "attrs": {"data-testid": re.compile(r"comment", re.I)}},
+        {"name": "div",     "attrs": {"id": re.compile(r"^comment", re.I)}},
+        {"name": "div",     "attrs": {"class": re.compile(r"^comment", re.I)}},
+        {"name": "div",     "attrs": {"class": re.compile(r"CommentItem")}},
+        {"name": "section", "attrs": {"class": re.compile(r"comments|Comment", re.I)}},
     ]
-    for sel in candidate_selectors:
-        for node in soup.select(sel):
+
+    root = None
+    for cand in container_candidates:
+        root = soup.find(cand["name"], attrs=cand["attrs"])
+        if root:
+            break
+    # ルートが見つからない場合は、ページ全体から限定セレクタで抽出
+    scope = root if root else soup
+
+    comments: List[str] = []
+
+    # --- コメント本文っぽい限定セレクタのみ（過剰一致の p[class*='sc-'] は使用しない） ---
+    strict_selectors = [
+        "div[class*='CommentItem__body']",
+        "div[class*='CommentItem__text']",
+        "p[class*='CommentItem__body']",
+        "p[class*='CommentItem__text']",
+        "span[class*='CommentItem__body']",
+        "span[class*='CommentItem__text']",
+        # コメントアイテム直下の本文候補
+        "div[class*='CommentItem'] p",
+        "div[class*='CommentItem'] span",
+    ]
+
+    # ノイズ定型文（コメントではない定型を除去）
+    noise_patterns = [
+        r"^\s*コメントを書く\s*$",
+        r"^\s*ヤフコメポリシー\s*$",
+        r"^\s*PayPay残高使えます\s*$",
+        r"税込\s*\d+\s*円",
+        r"\d{1,2}/\d{1,2}\(.+?\)\d{1,2}:\d{2}\s*配信",  # 例: 11/19(水)17:30配信
+        r"^\s*ABEMA\s*TIMES.*配信\s*$",
+        r"^\s*沖縄タイムス.*$",
+        # 記事見出し・告知系の定型（誤抽出対策）
+        r"^\s*【.+?】.*$",
+        r"^\s*前職.*選.*$",
+    ]
+    noise_re = re.compile("|".join(noise_patterns), re.I)
+
+    def is_comment_text(text: str) -> bool:
+        """コメント本文として妥当かどうかを判定"""
+        if not text:
+            return False
+        if len(text) < 6:  # 極端に短いものは除外
+            return False
+        if noise_re.search(text):
+            return False
+        return True
+
+    # 抽出
+    for sel in strict_selectors:
+        for node in scope.select(sel):
             text = node.get_text(strip=True)
-            # ある程度の長さがあるものだけ
-            if text and len(text) > 5 and text not in comments:
+            if is_comment_text(text) and text not in comments:
                 comments.append(text)
-    # 候補が少なすぎる場合は、より緩い抽出は行わず、そのまま返す
+
+    # コメントが全く拾えない場合は、最終手段として“緩いが範囲限定”の抽出を試す
+    if not comments and root:
+        for node in root.find_all(["p", "span", "div"]):
+            # コメントアイテムの近傍だけに限定
+            cls = " ".join(node.get("class", []))
+            if not re.search(r"CommentItem|comment", cls, re.I):
+                continue
+            text = node.get_text(strip=True)
+            if is_comment_text(text) and text not in comments:
+                comments.append(text)
+
     return comments
 
 def fetch_details_and_update(gc: gspread.Client) -> None:
@@ -559,11 +615,7 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
         if need_body:
             body_changed = False
             for page_idx in range(1, MAX_BODY_PAGES + 1):
-                if page_idx == 1:
-                    page_url = url
-                else:
-                    page_url = f"{url}?page={page_idx}"
-
+                page_url = url if page_idx == 1 else f"{url}?page={page_idx}"
                 text = fetch_article_body_page(page_url)
                 if not text:
                     # 2ページ目以降で本文が空 => 以降のページは存在しないとみなして break
@@ -595,11 +647,7 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
             page_strings: List[str] = [""] * MAX_COMMENT_PAGES
 
             for page_idx in range(1, MAX_COMMENT_PAGES + 1):
-                if page_idx == 1:
-                    c_url = url + "/comments"
-                else:
-                    c_url = url + f"/comments?page={page_idx}"
-
+                c_url = url + ("/comments" if page_idx == 1 else f"/comments?page={page_idx}")
                 comments = fetch_comments_page(c_url)
                 if not comments:
                     # コメントがまったく取れないページが来たら以降は終了
@@ -612,16 +660,12 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
                         comments = comments[:remaining]
                         all_comments.extend(comments)
                     # このページ分は番号付与＋超過注記付きで記録して終了
-                    numbered = []
-                    for i, c in enumerate(comments, start=1):
-                        numbered.append(f"[{i}] {c}")
+                    numbered = [f"[{i}] {c}" for i, c in enumerate(comments, start=1)]
                     page_strings[page_idx - 1] = "\n\n".join(numbered) + "\n\n(* over 3000 comments, truncated)"
                     break
                 else:
                     all_comments.extend(comments)
-                    numbered = []
-                    for i, c in enumerate(comments, start=1):
-                        numbered.append(f"[{i}] {c}")
+                    numbered = [f"[{i}] {c}" for i, c in enumerate(comments, start=1)]
                     # 超過していないので注記は付けない
                     page_strings[page_idx - 1] = "\n\n".join(numbered)
 
@@ -660,7 +704,6 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
     print(f" ✅ コメント取得＆Commentsシート更新を {update_comments_count} 行に実行")
 
 # ================== Gemini バッチ分析 ==================
-
 def analyze_with_gemini_batch(texts: List[str]) -> List[Dict[str, str]]:
     """
     最大100件の本文をまとめて Gemini で分析し、JSON配列を返す。
@@ -680,15 +723,14 @@ def analyze_with_gemini_batch(texts: List[str]) -> List[Dict[str, str]]:
         print("Geminiプロンプトが空のため、バッチ分析をスキップします。")
         return []
 
-    # 長さを制限（1件あたり3000文字まで：100件でも収まるように短めに）
+    # 長さを制限（1件あたり3000文字まで）
     trimmed_texts = [t[:3000] for t in texts]
 
     # {TEXT_BATCH} を生成
-    blocks = []
-    for i, txt in enumerate(trimmed_texts):
-        blocks.append(
-            f"==== ARTICLE {i} START ====\n{txt}\n==== ARTICLE {i} END ===="
-        )
+    blocks = [
+        f"==== ARTICLE {i} START ====\n{txt}\n==== ARTICLE {i} END ===="
+        for i, txt in enumerate(trimmed_texts)
+    ]
     text_batch = "\n\n".join(blocks)
     prompt = prompt_template.replace("{TEXT_BATCH}", text_batch)
 
@@ -698,9 +740,7 @@ def analyze_with_gemini_batch(texts: List[str]) -> List[Dict[str, str]]:
             resp = GEMINI_CLIENT.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=prompt,
-                config={
-                    "response_mime_type": "application/json",
-                },
+                config={"response_mime_type": "application/json"},
             )
             raw = to_str_safe(resp.text)
             try:
@@ -735,7 +775,7 @@ def analyze_with_gemini_batch(texts: List[str]) -> List[Dict[str, str]]:
             return out
 
         except ResourceExhausted as e:
-            # クォータ制限 -> ここで全体処理を終了させる（呼び出し側で検知）
+            # クォータ制限 -> 呼び出し側で検知
             print(f" 🚨 Gemini API クォータ制限エラー (429): {e}")
             raise
         except Exception as e:
@@ -825,7 +865,6 @@ def analyze_and_update_sheet(gc: gspread.Client) -> None:
         try:
             results = analyze_with_gemini_batch(texts)
         except ResourceExhausted:
-            # クォータ制限が出たらこれ以上の分析はあきらめる
             print(" 🚨 Geminiクォータ制限に到達したため、残りの分析は次回へ持ち越します。")
             break
 
@@ -843,7 +882,6 @@ def analyze_and_update_sheet(gc: gspread.Client) -> None:
             row_idx = item["row_index"]
             r = result_by_index.get(local_idx)
             if not r:
-                # 対応する結果がない場合はスキップ
                 continue
 
             company_info = r.get("company_info", "N/A")
@@ -863,7 +901,6 @@ def analyze_and_update_sheet(gc: gspread.Client) -> None:
     print(f" ✅ Geminiバッチ分析結果を {updated_count} 行に反映しました。")
 
 # ================== メイン処理 ==================
-
 def main():
     print("--- Yahooニュース統合スクレイパー開始 ---")
     keywords = load_keywords(KEYWORD_FILE)
