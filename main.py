@@ -24,9 +24,6 @@ from bs4 import BeautifulSoup
 import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 # --- Gemini API 関連 ---
 from google import genai
@@ -128,21 +125,18 @@ def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
     if raw is None:
         return None
     if isinstance(raw, (int, float)):
-        # gspreadは数値で返す可能性があるが、本関数では未対応→None
         return None
     if isinstance(raw, str):
         s = raw.strip()
         # （月）などの曜日を削除
-        s = re.sub(r"\([\u6708\u706b\u6c水\u6728\u91d1\u571f\u65e5]\)", "", s).strip()
+        s = re.sub(r"\([\u670月火水木金土日]\)", "", s).strip()
         # 「配信」を削除
         s = s.replace("配信", "").strip()
-        # よくあるフォーマットを順に試す
         for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%y/%m/%d %H:%M", "%m/%d %H:%M"):
             try:
                 dt = datetime.strptime(s, fmt)
                 if fmt == "%m/%d %H:%M":
                     dt = dt.replace(year=today_jst.year)
-                # 未来すぎる場合は前年補正
                 if dt.replace(tzinfo=TZ_JST) > today_jst + timedelta(days=31):
                     dt = dt.replace(year=dt.year - 1)
                 return dt.replace(tzinfo=TZ_JST)
@@ -163,7 +157,6 @@ def build_gspread_client() -> gspread.Client:
             credentials = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
             return gspread.authorize(credentials)
         else:
-            # ローカル fallback
             return gspread.service_account(filename="credentials.json")
     except FileNotFoundError:
         raise RuntimeError("Google認証情報が見つかりません (環境変数 GCP_SERVICE_ACCOUNT_KEY または credentials.json を確認)")
@@ -197,7 +190,6 @@ def load_gemini_batch_prompt() -> str:
         return GEMINI_BATCH_PROMPT_BASE
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        # 役割プロンプト
         role_path = os.path.join(script_dir, PROMPT_FILES[0])
         with open(role_path, "r", encoding="utf-8") as f:
             role_instruction = f.read().strip()
@@ -216,7 +208,6 @@ def load_gemini_batch_prompt() -> str:
             return GEMINI_BATCH_PROMPT_BASE
 
         base = role_instruction + "\n" + "\n".join(other_contents)
-        # 追加の明示的な指示（バッチ & 日産抽出）
         extra = """ 
 追加要件:
 - 与えられる記事本文は最大で100件です。
@@ -224,24 +215,11 @@ def load_gemini_batch_prompt() -> str:
  * company_info: 記事の主題企業名。共同開発などがあれば () 内に別企業も書いてください。
  * category: PROMPTで指定のカテゴリ分類に従ってください。
  * sentiment: 記事全体のトーンを「ポジティブ」「ネガティブ」「ニュートラル」のいずれかで判定してください。
- * nissan_related: 記事本文中で「日産」や「NISSAN」「ニッサン」など、日産自動車やその商品・サービスに言及している文を、日本語の文章として可能な限り抽出してまとめてください。なければ "N/A" としてください。
- * nissan_negative: 上記 nissan_related の文のうち、日産や日産の商品・サービスに対してネガティブな印象を与える内容（批判・不満・懸念など）だけを抽出してまとめてください。なければ "N/A" としてください。
+ * nissan_related: 記事本文中で「日産」や「NISSAN」「ニッサン」などの言及文を抽出。なければ "N/A"。
+ * nissan_negative: 上記のうちネガティブな印象の文のみ抽出。なければ "N/A"。
 
-出力フォーマット:
-- 必ず JSON 配列形式で出力してください。
-- 配列の各要素は、次のキーを持つオブジェクトとします:
-{
-  "index": 0,
-  "company_info": "string",
-  "category": "string",
-  "sentiment": "string",
-  "nissan_related": "string",
-  "nissan_negative": "string"
-}
-
-入力フォーマット:
-- 以下のように、記事本文が複数与えられます。
-- "==== ARTICLE i START ====" と "==== ARTICLE i END ====" に挟まれた部分が、index=i の記事本文です。
+出力フォーマット: JSON 配列（各要素: index, company_info, category, sentiment, nissan_related, nissan_negative）
+入力フォーマット: "==== ARTICLE i START ===="〜"==== ARTICLE i END ====" が index=i の本文
 """
         base += "\n\n" + extra + "\n\n{TEXT_BATCH}"
         GEMINI_BATCH_PROMPT_BASE = base
@@ -276,6 +254,105 @@ def request_with_retry(url: str, max_retries: int = 3) -> Optional[requests.Resp
                 return None
     return None
 
+# ================== 検索結果から記事URL抽出（HTML＋テキスト両対応） ==================
+def extract_article_urls(page_html: str) -> List[str]:
+    """
+    検索結果ページの HTML/テキストから、記事URL（https://news.yahoo.co.jp/articles/xxxxx）を収集。
+    BeautifulSoupでの<a>抽出と、正規表現の両方で拾い、重複除去して返す。
+    """
+    urls: List[str] = []
+
+    # 1) HTMLアンカーから抽出
+    try:
+        soup = BeautifulSoup(page_html, "html.parser")
+        for a in soup.select('a[href^="https://news.yahoo.co.jp/articles/"]'):
+            href = a.get("href", "")
+            if href and href.startswith("https://news.yahoo.co.jp/articles/"):
+                urls.append(href)
+    except Exception:
+        pass
+
+    # 2) プレーンテキスト中の URL を正規表現で抽出（Markdown風のテキストにも対応）
+    try:
+        regex = re.compile(r"https://news\.yahoo\.co\.jp/articles/[A-Za-z0-9]+")
+        urls.extend(regex.findall(page_html))
+    except Exception:
+        pass
+
+    # 重複除去＆順序保持
+    seen = set()
+    unique_urls = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique_urls.append(u)
+
+    return unique_urls
+
+# ================== 記事ページからメタ情報取得 ==================
+def fetch_article_meta(url: str) -> Dict[str, str]:
+    """
+    記事ページから タイトル／投稿日時（文字列）／ソース（提供社名） を取得。
+    ページ構造の差異に耐えるため、複数の候補を試す。
+    """
+    meta = {"タイトル": "", "投稿日時": "", "ソース": ""}
+
+    res = request_with_retry(url)
+    if not res:
+        return meta
+
+    soup = BeautifulSoup(res.text, "html.parser")
+
+    # タイトル: h1 または og:title
+    title = ""
+    h1 = soup.find("h1")
+    if h1 and to_str_safe(h1.text):
+        title = to_str_safe(h1.text)
+    else:
+        og = soup.find("meta", attrs={"property": "og:title"})
+        if og and og.get("content"):
+            title = to_str_safe(og.get("content"))
+
+    # 日時: <time> のテキストを優先
+    post_str = ""
+    time_tag = soup.find("time")
+    if time_tag and to_str_safe(time_tag.text):
+        post_str = to_str_safe(time_tag.text)
+    else:
+        # 文章内から "11/19(水)17:45配信" などを探索
+        m = re.search(r"\d{1,2}/\d{1,2}\(.+?\)\d{1,2}:\d{2}\s*配信", soup.get_text())
+        if m:
+            post_str = to_str_safe(m.group(0))
+
+    # ソース: 提供社リンクやラベル
+    source = ""
+    # 提供社へのリンクっぽい要素
+    provider_candidates = [
+        ("a", {"href": re.compile(r"/media/")}),
+        ("a", {"class": re.compile(r"provider|media", re.I)}),
+        ("span", {"class": re.compile(r"provider|media", re.I)}),
+        ("div", {"class": re.compile(r"provider|media", re.I)}),
+    ]
+    for name, attrs in provider_candidates:
+        el = soup.find(name, attrs=attrs)
+        if el and to_str_safe(el.get_text()):
+            source = to_str_safe(el.get_text())
+            break
+    if not source:
+        # ページのテキストから候補抽出（例: "時事通信", "日刊スポーツ" など）
+        candidates = ["時事通信", "日刊スポーツ", "スポーツ報知", "J-CASTニュース", "沖縄タイムス",
+                      "共同通信", "朝日新聞", "読売新聞", "毎日新聞", "産経新聞", "NHK"]
+        text = soup.get_text()
+        for name in candidates:
+            if name in text:
+                source = name
+                break
+
+    meta["タイトル"] = title
+    meta["投稿日時"] = post_str if post_str else "取得不可"
+    meta["ソース"]   = source if source else "取得不可"
+    return meta
+
 # ================== Yahooニュース検索 (Selenium) ==================
 def get_yahoo_news_with_selenium(keyword: str) -> List[Dict[str, str]]:
     print(f" Yahoo!ニュース検索開始 (キーワード: {keyword})...")
@@ -290,7 +367,6 @@ def get_yahoo_news_with_selenium(keyword: str) -> List[Dict[str, str]]:
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    # GitHub Actions では PATH 上の chromedriver を使う想定
     try:
         driver = webdriver.Chrome(options=options)
     except Exception as e:
@@ -302,72 +378,28 @@ def get_yahoo_news_with_selenium(keyword: str) -> List[Dict[str, str]]:
         "&categories=domestic,world,business,it,science,life,local"
     )
     driver.get(search_url)
-    try:
-        WebDriverWait(driver, 20).until(
-            EC.visibility_of_element_located((By.CSS_SELECTOR, "li[class*='sc-1u4589e-0']"))
-        )
-        time.sleep(3)
-    except Exception as e:
-        print(f" ⚠️ ページロード/要素待ちタイムアウト: {e}")
-        time.sleep(5)
+    time.sleep(3)  # 検索結果の初期レンダリング待ち（構造変化対策で固定秒）
 
-    soup = BeautifulSoup(driver.page_source, "html.parser")
+    page_html = driver.page_source
     driver.quit()
 
-    articles = soup.find_all("li", class_=re.compile("sc-1u4589e-0"))
+    # 記事URLの抽出（HTML＋テキスト両対応）
+    urls = extract_article_urls(page_html)
+    if not urls:
+        print(" ⚠️ 記事URLを検出できませんでした。構造変更の可能性があります。")
+        return []
+
     articles_data: List[Dict[str, str]] = []
-    today_jst = jst_now()
-
-    for article in articles:
-        try:
-            title_tag = article.find("div", class_=re.compile("sc-3ls169-0"))
-            title = title_tag.text.strip() if title_tag else ""
-            link_tag = article.find("a", href=True)
-            url = (
-                link_tag["href"]
-                if link_tag and link_tag["href"].startswith("https://news.yahoo.co.jp/articles/")
-                else ""
-            )
-            time_tag = article.find("time")
-            date_str = time_tag.text.strip() if time_tag else ""
-            # ソース抽出（構造は変わりやすいので長めテキストを採用）
-            source_text = ""
-            source_container = article.find("div", class_=re.compile("sc-n3vj8g-0"))
-            if source_container:
-                time_and_comments = source_container.find("div", class_=re.compile("sc-110wjhy-8"))
-                if time_and_comments:
-                    spans = [
-                        s.text.strip()
-                        for s in time_and_comments.find_all("span")
-                        if not s.find("svg")
-                    ]
-                    # 日付っぽいものは除外
-                    spans = [
-                        s for s in spans
-                        if not re.match(r"\d{1,2}/\d{1,2}.*\d{1,2}:\d{2}", s)
-                    ]
-                    if spans:
-                        source_text = max(spans, key=len)
-
-            formatted_date = "取得不可"
-            if date_str:
-                dt_obj = parse_post_date(date_str, today_jst)
-                if dt_obj:
-                    formatted_date = format_datetime(dt_obj)
-                else:
-                    formatted_date = re.sub(r"\([\u670月火水木金土日]\)", "", date_str).strip()
-
-            if title and url:
-                articles_data.append(
-                    {
-                        "URL": url,
-                        "タイトル": title,
-                        "投稿日時": formatted_date,
-                        "ソース": source_text or "取得不可",
-                    }
-                )
-        except Exception:
-            continue
+    for url in urls:
+        # 記事ページ側からメタ情報取得（タイトル・日時・ソース）
+        meta = fetch_article_meta(url)
+        if url:
+            articles_data.append({
+                "URL": url,
+                "タイトル": meta.get("タイトル", "") or "",
+                "投稿日時": meta.get("投稿日時", "") or "取得不可",
+                "ソース": meta.get("ソース", "") or "取得不可",
+            })
 
     print(f" Yahoo!ニュース件数: {len(articles_data)} 件取得")
     return articles_data
@@ -426,7 +458,6 @@ def write_news_list_to_source(gc: gspread.Client, articles: List[Dict[str, str]]
             a["投稿日時"],
             a["ソース"],
         ]
-        # 残りの列は空で埋める
         row.extend([""] * (len(YAHOO_SHEET_HEADERS) - len(row)))
         new_rows.append(row)
 
@@ -438,14 +469,11 @@ def write_news_list_to_source(gc: gspread.Client, articles: List[Dict[str, str]]
 
 # ================== 本文・コメント取得 ==================
 def fetch_article_body_page(url: str) -> str:
-    """
-    記事の単一ページから本文テキストを抽出
-    """
+    """記事の単一ページから本文テキストを抽出"""
     res = request_with_retry(url)
     if not res:
         return ""
     soup = BeautifulSoup(res.text, "html.parser")
-    # articleタグや article_body相当を探す
     article_content = (
         soup.find("article")
         or soup.find("div", class_="article_body")
@@ -453,7 +481,6 @@ def fetch_article_body_page(url: str) -> str:
     )
     texts: List[str] = []
     if article_content:
-        # ハイライト対象の p から優先的に取得
         paragraphs = article_content.find_all("p", class_=re.compile(r"highLightSearchTarget"))
         if not paragraphs:
             paragraphs = article_content.find_all("p")
@@ -474,7 +501,7 @@ def fetch_comments_page(url: str) -> List[str]:
 
     soup = BeautifulSoup(res.text, "html.parser")
 
-    # --- コメント領域の起点候補（ページ構造の揺れ対策で複数試す） ---
+    # コメント領域の起点候補
     container_candidates = [
         {"name": "section", "attrs": {"id": re.compile(r"^comments?$", re.I)}},
         {"name": "section", "attrs": {"data-testid": re.compile(r"comment", re.I)}},
@@ -489,12 +516,11 @@ def fetch_comments_page(url: str) -> List[str]:
         root = soup.find(cand["name"], attrs=cand["attrs"])
         if root:
             break
-    # ルートが見つからない場合は、ページ全体から限定セレクタで抽出
     scope = root if root else soup
 
     comments: List[str] = []
 
-    # --- コメント本文っぽい限定セレクタのみ（過剰一致の p[class*='sc-'] は使用しない） ---
+    # コメント本文っぽい限定セレクタのみ
     strict_selectors = [
         "div[class*='CommentItem__body']",
         "div[class*='CommentItem__text']",
@@ -502,47 +528,42 @@ def fetch_comments_page(url: str) -> List[str]:
         "p[class*='CommentItem__text']",
         "span[class*='CommentItem__body']",
         "span[class*='CommentItem__text']",
-        # コメントアイテム直下の本文候補
         "div[class*='CommentItem'] p",
         "div[class*='CommentItem'] span",
     ]
 
-    # ノイズ定型文（コメントではない定型を除去）
+    # ノイズ定型文除去
     noise_patterns = [
         r"^\s*コメントを書く\s*$",
         r"^\s*ヤフコメポリシー\s*$",
         r"^\s*PayPay残高使えます\s*$",
         r"税込\s*\d+\s*円",
-        r"\d{1,2}/\d{1,2}\(.+?\)\d{1,2}:\d{2}\s*配信",  # 例: 11/19(水)17:30配信
+        r"\d{1,2}/\d{1,2}\(.+?\)\d{1,2}:\d{2}\s*配信",
         r"^\s*ABEMA\s*TIMES.*配信\s*$",
         r"^\s*沖縄タイムス.*$",
-        # 記事見出し・告知系の定型（誤抽出対策）
         r"^\s*【.+?】.*$",
         r"^\s*前職.*選.*$",
     ]
     noise_re = re.compile("|".join(noise_patterns), re.I)
 
     def is_comment_text(text: str) -> bool:
-        """コメント本文として妥当かどうかを判定"""
         if not text:
             return False
-        if len(text) < 6:  # 極端に短いものは除外
+        if len(text) < 6:
             return False
         if noise_re.search(text):
             return False
         return True
 
-    # 抽出
     for sel in strict_selectors:
         for node in scope.select(sel):
             text = node.get_text(strip=True)
             if is_comment_text(text) and text not in comments:
                 comments.append(text)
 
-    # コメントが全く拾えない場合は、最終手段として“緩いが範囲限定”の抽出を試す
+    # 何も拾えない場合の最終手段（範囲限定）
     if not comments and root:
         for node in root.find_all(["p", "span", "div"]):
-            # コメントアイテムの近傍だけに限定
             cls = " ".join(node.get("class", []))
             if not re.search(r"CommentItem|comment", cls, re.I):
                 continue
@@ -554,7 +575,7 @@ def fetch_comments_page(url: str) -> List[str]:
 
 def fetch_details_and_update(gc: gspread.Client) -> None:
     """
-    Yahooシートの各行について:
+    各行について:
      - 本文10ページ分 (E〜N) を取得・更新
      - コメント数 (O) を更新
      - Commentsシートにコメント10ページ分を書き込み
@@ -570,7 +591,6 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
     data_rows = values[1:]
     print("\n===== 📄 ステップ2: 本文＆コメント取得・Commentsシート更新 =====")
 
-    # Commentsシート側のURL→row番号マップを先に作っておく
     comments_values = comments_ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
     comments_url_to_row: Dict[str, int] = {}
     if comments_values:
@@ -582,7 +602,6 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
     update_comments_count = 0
 
     for idx, row in enumerate(data_rows, start=2):
-        # 行長をヘッダ長に合わせる
         if len(row) < len(YAHOO_SHEET_HEADERS):
             row.extend([""] * (len(YAHOO_SHEET_HEADERS) - len(row)))
 
@@ -594,15 +613,10 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
         post_date = to_str_safe(row[2])
         source = to_str_safe(row[3])
 
-        # 本文列 (E〜N)
         body_pages = row[4:4 + MAX_BODY_PAGES]
-        # コメント数 (O)
         comment_count_str = to_str_safe(row[14]) if len(row) > 14 else ""
 
-        # 本文P1 が空の場合のみ本文取得（無限再取得防止）
         need_body = not to_str_safe(body_pages[0])
-
-        # コメント関連は都度更新（古いコメント数を残したくないため）
         need_comments = True
 
         new_body_pages = list(body_pages)
@@ -611,26 +625,23 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
         if need_body or need_comments:
             print(f" - 行 {idx} (記事: {title[:20]}...): 詳細取得中...")
 
-        # ===== 本文取得（最大10ページ） =====
+        # 本文取得（最大10ページ）
         if need_body:
             body_changed = False
             for page_idx in range(1, MAX_BODY_PAGES + 1):
                 page_url = url if page_idx == 1 else f"{url}?page={page_idx}"
                 text = fetch_article_body_page(page_url)
                 if not text:
-                    # 2ページ目以降で本文が空 => 以降のページは存在しないとみなして break
                     if page_idx == 1:
-                        # 1ページ目すら取れない場合
                         new_body_pages[0] = "本文取得不可"
                         body_changed = True
                     break
 
-                col_idx = page_idx - 1  # 0~9
+                col_idx = page_idx - 1
                 if to_str_safe(new_body_pages[col_idx]) != text:
                     new_body_pages[col_idx] = text
                     body_changed = True
 
-            # 更新反映
             if body_changed:
                 yahoo_ws.update(
                     range_name=f"E{idx}:N{idx}",
@@ -638,10 +649,9 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
                     value_input_option="USER_ENTERED",
                 )
                 update_body_count += 1
-                # シート API 負荷対策
                 time.sleep(1 + random.random() * 0.5)
 
-        # ===== コメント取得（最大10ページ） =====
+        # コメント取得（最大10ページ）
         if need_comments:
             all_comments: List[str] = []
             page_strings: List[str] = [""] * MAX_COMMENT_PAGES
@@ -650,29 +660,23 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
                 c_url = url + ("/comments" if page_idx == 1 else f"/comments?page={page_idx}")
                 comments = fetch_comments_page(c_url)
                 if not comments:
-                    # コメントがまったく取れないページが来たら以降は終了
                     break
 
-                # 総数制限
                 if len(all_comments) + len(comments) > MAX_COMMENTS_TOTAL:
                     remaining = MAX_COMMENTS_TOTAL - len(all_comments)
                     if remaining > 0:
                         comments = comments[:remaining]
                         all_comments.extend(comments)
-                    # このページ分は番号付与＋超過注記付きで記録して終了
                     numbered = [f"[{i}] {c}" for i, c in enumerate(comments, start=1)]
                     page_strings[page_idx - 1] = "\n\n".join(numbered) + "\n\n(* over 3000 comments, truncated)"
                     break
                 else:
                     all_comments.extend(comments)
                     numbered = [f"[{i}] {c}" for i, c in enumerate(comments, start=1)]
-                    # 超過していないので注記は付けない
                     page_strings[page_idx - 1] = "\n\n".join(numbered)
 
-            # コメント数更新
             new_comment_count = str(len(all_comments))
 
-            # Yahooシート側 O列
             yahoo_ws.update(
                 range_name=f"O{idx}:O{idx}",
                 values=[[new_comment_count]],
@@ -680,22 +684,19 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
             )
             update_comments_count += 1
 
-            # Commentsシート側
             base_vals = [url, title, post_date, source, new_comment_count]
             base_vals.extend(page_strings)
 
             if url in comments_url_to_row:
                 c_row = comments_url_to_row[url]
-                # 既存行を上書き
                 comments_ws.update(
                     range_name=f"A{c_row}:{gspread.utils.rowcol_to_a1(c_row, 5 + MAX_COMMENT_PAGES)}",
                     values=[base_vals],
                     value_input_option="USER_ENTERED",
                 )
             else:
-                # 新規行として末尾に追加
                 comments_ws.append_row(base_vals, value_input_option="USER_ENTERED")
-                new_row_index = len(comments_values) + 1 + len(comments_url_to_row)  # ざっくり
+                new_row_index = len(comments_values) + 1 + len(comments_url_to_row)
                 comments_url_to_row[url] = new_row_index
 
             time.sleep(1 + random.random() * 0.5)
@@ -705,16 +706,10 @@ def fetch_details_and_update(gc: gspread.Client) -> None:
 
 # ================== Gemini バッチ分析 ==================
 def analyze_with_gemini_batch(texts: List[str]) -> List[Dict[str, str]]:
-    """
-    最大100件の本文をまとめて Gemini で分析し、JSON配列を返す。
-    texts[i] が index=i に対応。
-    """
-    if not GEMINI_CLIENT:
-        return []
-    if not texts:
+    """最大100件の本文をまとめて Gemini で分析し、JSON配列を返す。"""
+    if not GEMINI_CLIENT or not texts:
         return []
 
-    # 念のためバッチサイズを上限に収める
     if len(texts) > GEMINI_MAX_BATCH_SIZE:
         texts = texts[:GEMINI_MAX_BATCH_SIZE]
 
@@ -723,10 +718,7 @@ def analyze_with_gemini_batch(texts: List[str]) -> List[Dict[str, str]]:
         print("Geminiプロンプトが空のため、バッチ分析をスキップします。")
         return []
 
-    # 長さを制限（1件あたり3000文字まで）
     trimmed_texts = [t[:3000] for t in texts]
-
-    # {TEXT_BATCH} を生成
     blocks = [
         f"==== ARTICLE {i} START ====\n{txt}\n==== ARTICLE {i} END ===="
         for i, txt in enumerate(trimmed_texts)
@@ -775,7 +767,6 @@ def analyze_with_gemini_batch(texts: List[str]) -> List[Dict[str, str]]:
             return out
 
         except ResourceExhausted as e:
-            # クォータ制限 -> 呼び出し側で検知
             print(f" 🚨 Gemini API クォータ制限エラー (429): {e}")
             raise
         except Exception as e:
@@ -789,15 +780,7 @@ def analyze_with_gemini_batch(texts: List[str]) -> List[Dict[str, str]]:
     return []
 
 def analyze_and_update_sheet(gc: gspread.Client) -> None:
-    """
-    Yahooシートの本文 (E〜N) が入っている行で、
-     - P:主題企業
-     - Q:カテゴリ
-     - R:ポジネガ
-     - S:日産関連文
-     - T:日産ネガ文
-    が空のものを対象に、最大100件まとめて Gemini で分析＆更新する。
-    """
+    """本文の入っている行の P〜T 列を Gemini 分析で更新"""
     if not GEMINI_CLIENT:
         print("Geminiクライアントが初期化されていないため、分析をスキップします。")
         return
@@ -811,7 +794,6 @@ def analyze_and_update_sheet(gc: gspread.Client) -> None:
     data_rows = values[1:]
     print("\n===== 🧠 ステップ3: Geminiバッチ分析 (100件/1API) =====")
 
-    # 分析対象行を収集
     targets: List[Dict[str, Any]] = []
     for idx, row in enumerate(data_rows, start=2):
         if len(row) < len(YAHOO_SHEET_HEADERS):
@@ -821,7 +803,6 @@ def analyze_and_update_sheet(gc: gspread.Client) -> None:
         if not url.startswith("https://news.yahoo.co.jp/articles/"):
             continue
 
-        # 本文ページを結合
         pages = row[4:4 + MAX_BODY_PAGES]
         pages = [p for p in pages if to_str_safe(p) and p != "本文取得不可"]
         if not pages:
@@ -831,7 +812,6 @@ def analyze_and_update_sheet(gc: gspread.Client) -> None:
             f"【Page{i+1}】\n{to_str_safe(p)}" for i, p in enumerate(pages)
         )
 
-        # すでに P〜T がすべて埋まっている行はスキップ
         company_info = to_str_safe(row[15]) if len(row) > 15 else ""
         category     = to_str_safe(row[16]) if len(row) > 16 else ""
         sentiment    = to_str_safe(row[17]) if len(row) > 17 else ""
@@ -856,7 +836,6 @@ def analyze_and_update_sheet(gc: gspread.Client) -> None:
     print(f" Gemini分析対象: {len(targets)} 行")
     updated_count = 0
 
-    # 100件ずつバッチ処理
     for i in range(0, len(targets), GEMINI_MAX_BATCH_SIZE):
         batch = targets[i : i + GEMINI_MAX_BATCH_SIZE]
         texts = [t["body"] for t in batch]
@@ -868,7 +847,6 @@ def analyze_and_update_sheet(gc: gspread.Client) -> None:
             print(" 🚨 Geminiクォータ制限に到達したため、残りの分析は次回へ持ち越します。")
             break
 
-        # index で紐づけ
         result_by_index: Dict[int, Dict[str, str]] = {}
         for r in results:
             try:
@@ -877,7 +855,6 @@ def analyze_and_update_sheet(gc: gspread.Client) -> None:
                 idx_int = 0
             result_by_index[idx_int] = r
 
-        # バッチ内各行を更新
         for local_idx, item in enumerate(batch):
             row_idx = item["row_index"]
             r = result_by_index.get(local_idx)
@@ -930,7 +907,6 @@ def main():
     print("\n--- Yahooニュース統合スクレイパー完了 ---")
 
 if __name__ == "__main__":
-    # スクリプトディレクトリを sys.path に追加（PROMPT_FILES 読み込み用）
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if script_dir not in sys.path:
         sys.path.append(script_dir)
